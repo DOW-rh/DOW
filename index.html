@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dinos of Wallstreet</title>
+<meta name="description" content="Permanent withdrawal page for NFTs held in the Dinos of Wallstreet staking vault.">
+<!--
+  ============================================================================
+  DINOS OF WALLSTREET - PERMANENT WITHDRAWAL PAGE
+
+  No dependencies. No CDN, no npm, no build step, no backend. Everything is in
+  this one file, which is the point: it has to keep working after the site, the
+  dev server and the database are gone.
+
+  WHY THERE ARE RAW HEX SELECTORS BELOW. Calling a contract needs a function
+  selector, which is a keccak hash of the signature. Hashing in the browser
+  would mean loading a crypto library from a CDN, and a CDN is a dependency that
+  can 404 in three years. So the selectors were computed once, offline, and
+  written down here. They are verifiable: keccak256 of each signature in the
+  comment, first 4 bytes.
+
+  Vault: 0x2Ba3b710487C6bb14f256b9B876b7FddB8B273f4 on Robinhood Chain (4663).
+  The vault has no function, owner-only or otherwise, that moves an NFT to
+  anybody but the wallet that staked it. This page calls withdraw() or
+  emergencyWithdraw() on the connected wallet's own token ids, and can do
+  nothing else.
+  ============================================================================
+-->
+<style>
+  body { max-width: 34em; margin: 3em auto; padding: 0 1em;
+         font: 16px/1.6 system-ui, sans-serif; }
+  section { margin: 2em 0; }
+  button { font: inherit; padding: .4em 1em; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  .mono { font-family: monospace; font-size: .85em; word-break: break-all; }
+  .note { color: #555; font-size: .9em; }
+  .err { color: #a33; }
+</style>
+</head>
+<body>
+
+<h1>Dinos of Wallstreet</h1>
+
+<p>Operational costs have exceeded inflow for several weeks now, so we must
+unfortunately announce that we are shutting down the Dinos of Wallstreet
+experience. We hold no custody over your staked NFTs, so you&rsquo;ll need to
+withdraw them yourself from the menu below. Thank you all for participating.</p>
+
+<section>
+  <button id="connect">Connect wallet</button>
+  <span id="account" class="mono"></span>
+  <p id="wallets" class="note"></p>
+  <p id="chainStatus" class="note"></p>
+</section>
+
+<section>
+  <button id="scan" disabled>Find my dinos</button>
+  <span id="scanning" class="note"></span>
+  <p id="found"></p>
+</section>
+
+<section>
+  <button id="withdraw" disabled>Withdraw</button>
+  <span id="batchNote" class="note"></span>
+  <p id="txStatus" class="note"></p>
+</section>
+
+<script>
+/* Constants. Selectors are keccak256(signature)[0:4], computed offline. */
+const VAULT       = '0x2Ba3b710487C6bb14f256b9B876b7FddB8B273f4';
+const CHAIN_HEX   = '0x1237';                 // 4663
+const CHAIN_NAME  = 'Robinhood Chain';
+const RPC_URL     = 'https://rpc.mainnet.chain.robinhood.com';
+const FROM_BLOCK  = 50499763;                 // vault deployment
+const LOG_CHUNK   = 9000000;                  // endpoint caps getLogs at 10,000,000
+const MAX_BATCH   = 50;                       // DinoStakeVault.MAX_BATCH
+
+const SEL = {
+  paused:            '0x5c975abb', // paused()
+  withdrawalOpen:    '0x7757fc5d', // withdrawalOpen()
+  custodyOf:         '0x65269e47', // custodyOf(uint256)
+  withdraw:          '0x983d95ce', // withdraw(uint256[])
+  emergencyWithdraw: '0xd1941b06', // emergencyWithdraw(uint256[])
+};
+// keccak256('Staked(uint256,address,uint8)')
+const TOPIC_STAKED = '0x79a08b4c013616195b58bb5d7da4764bb61a76e3bd70c83a318d191ff9d28f19';
+
+/* Minimal ABI helpers -- only the shapes this page needs. */
+const word = (n) => BigInt(n).toString(16).padStart(64, '0');
+const padAddr = (a) => '0x' + a.toLowerCase().replace(/^0x/, '').padStart(64, '0');
+const encodeUintArray = (sel, ids) => sel + word(32) + word(ids.length) + ids.map(word).join('');
+const decodeAddress = (hex) => '0x' + hex.replace(/^0x/, '').slice(24, 64);
+const decodeBool = (hex) => BigInt('0x' + hex.replace(/^0x/, '').slice(0, 64)) !== 0n;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"']/g,
+  (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+/*
+ * JSON-RPC with backoff. The public endpoint rate-limits under load, and a page
+ * that gives up on the first 429 is a page that strands somebody's NFT.
+ */
+async function send(body, attempts = 6) {
+  for (let a = 0; a < attempts; a++) {
+    let res;
+    try {
+      res = await fetch(RPC_URL, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    } catch (e) {
+      if (a === attempts - 1) throw new Error('could not reach the network');
+      await sleep(1200 * (a + 1));
+      continue;
+    }
+    if (res.status === 429 || res.status >= 500) { await sleep(1500 * (a + 1)); continue; }
+    return res.json();
+  }
+  throw new Error('the network is busy — wait a minute and try again');
+}
+
+async function rpc(method, params) {
+  const json = await send({ jsonrpc: '2.0', id: 1, method, params });
+  if (json.error) throw new Error(json.error.message || 'request failed');
+  return json.result;
+}
+
+async function rpcBatch(calls) {
+  const json = await send(calls.map((c, i) => ({ jsonrpc: '2.0', id: i, ...c })));
+  if (!Array.isArray(json)) throw new Error('unexpected response');
+  const out = new Array(calls.length);
+  for (const e of json) out[e.id] = e.error ? null : e.result;
+  return out;
+}
+
+const call = (data) => rpc('eth_call', [{ to: VAULT, data }, 'latest']);
+
+let account = null;
+let tokenIds = [];
+let exitFn = null;
+let provider = null;
+
+/* ------------------------------------------------------- wallet discovery */
+
+/*
+ * EIP-6963 first, `window.ethereum` second.
+ *
+ * With more than one wallet extension installed, `window.ethereum` is whichever
+ * one won the race to assign it -- or a conflict-manager proxy, or absent. The
+ * 6963 handshake asks every installed wallet to announce itself instead, which
+ * is both reliable and lets the holder pick the wallet their dinos are actually
+ * in. Wallets that predate 6963 still turn up through the `window.ethereum`
+ * fallback.
+ */
+const discovered = new Map(); // rdns -> { info, provider }
+
+window.addEventListener('eip6963:announceProvider', (event) => {
+  const d = event.detail;
+  if (d && d.info && d.provider) discovered.set(d.info.rdns || d.info.name, d);
+});
+window.dispatchEvent(new Event('eip6963:requestProvider'));
+
+function available() {
+  const list = [...discovered.values()].map((d) => ({ name: d.info.name, provider: d.provider }));
+  if (list.length === 0 && window.ethereum) list.push({ name: 'Browser wallet', provider: window.ethereum });
+  return list;
+}
+
+/* ---------------------------------------------------------------- connect */
+
+$('connect').addEventListener('click', async () => {
+  // Give a late-injecting extension a moment, then ask again.
+  if (available().length === 0) {
+    window.dispatchEvent(new Event('eip6963:requestProvider'));
+    await sleep(300);
+  }
+
+  const wallets = available();
+
+  if (wallets.length === 0) {
+    $('chainStatus').innerHTML = '<span class="err">No wallet detected.</span>' +
+      (location.protocol === 'file:'
+        ? ' This page is open from a file on your computer, and wallet extensions do not work on <code>file://</code> pages unless you turn on “Allow access to file URLs” in the extension’s settings. Opening the published web link instead will work.'
+        : ' Open this page in a browser with a wallet extension, or in your wallet’s own browser.');
+    return;
+  }
+
+  if (wallets.length > 1 && !provider) {
+    $('wallets').innerHTML = 'Choose a wallet: ';
+    wallets.forEach((w, i) => {
+      const b = document.createElement('button');
+      b.textContent = w.name;
+      b.style.marginRight = '.4em';
+      b.addEventListener('click', () => { provider = w.provider; $('wallets').textContent = w.name; connect(); });
+      $('wallets').appendChild(b);
+    });
+    return;
+  }
+
+  provider = provider || wallets[0].provider;
+  connect();
+});
+
+async function connect() {
+  try {
+    account = (await provider.request({ method: 'eth_requestAccounts' }))[0];
+    $('account').textContent = account;
+    $('connect').textContent = 'Connected';
+    if (provider.on) {
+      provider.on('accountsChanged', () => window.location.reload());
+      provider.on('chainChanged', () => window.location.reload());
+    }
+    await ensureChain();
+    await readVaultMode();
+    $('scan').disabled = false;
+  } catch (e) {
+    $('chainStatus').innerHTML = '<span class="err">' + esc(e.message || e) + '</span>';
+  }
+}
+
+async function ensureChain() {
+  const current = await provider.request({ method: 'eth_chainId' });
+  if (current.toLowerCase() === CHAIN_HEX) return;
+  try {
+    await provider.request({
+      method: 'wallet_switchEthereumChain',
+      params: [{ chainId: CHAIN_HEX }],
+    });
+  } catch (err) {
+    // 4902 = chain unknown to this wallet; offer to add it.
+    if (err && (err.code === 4902 || err.code === -32603)) {
+      await provider.request({
+        method: 'wallet_addEthereumChain',
+        params: [{
+          chainId: CHAIN_HEX,
+          chainName: CHAIN_NAME,
+          nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+          rpcUrls: [RPC_URL],
+        }],
+      });
+    } else {
+      throw err;
+    }
+  }
+}
+
+/*
+ * Which exit is open. `paused` gates deposits and the weekend withdrawal with
+ * one flag, so exactly one of the two doors is ever open. Asking the contract
+ * beats deriving it from a calendar and the wall clock, which is how a UI ends
+ * up disagreeing with the transaction it is about to send.
+ */
+async function readVaultMode() {
+  const [paused, open] = await Promise.all([call(SEL.paused), call(SEL.withdrawalOpen)])
+    .then(([p, o]) => [decodeBool(p), decodeBool(o)]);
+
+  if (paused) {
+    exitFn = 'emergencyWithdraw';
+    $('chainStatus').textContent = 'Withdrawals are open every day. There is no deadline.';
+  } else if (open) {
+    exitFn = 'withdraw';
+    $('chainStatus').textContent = 'Withdrawals are open right now.';
+  } else {
+    exitFn = null;
+    $('chainStatus').textContent = 'Withdrawals are closed at this moment, because a reward week is still running. They reopen at the weekend. Nothing is lost — come back then.';
+  }
+}
+
+/* ------------------------------------------------------------------- scan */
+
+/*
+ * The vault has no `tokensOf(address)`, so this is two steps:
+ *   1. `Staked` has an indexed staker, so one filtered log query per block
+ *      chunk returns every token this wallet ever put in.
+ *   2. `custodyOf` says which of those are still in there. Anything staked and
+ *      later withdrawn drops out here.
+ */
+$('scan').addEventListener('click', async () => {
+  $('scan').disabled = true;
+  $('withdraw').disabled = true;
+  $('found').textContent = '';
+  $('batchNote').textContent = '';
+  $('scanning').textContent = 'searching…';
+  try {
+    const latest = parseInt(await rpc('eth_blockNumber', []), 16);
+    const ever = new Set();
+    const chunks = Math.ceil((latest - FROM_BLOCK + 1) / LOG_CHUNK);
+    let done = 0;
+    for (let start = FROM_BLOCK; start <= latest; start += LOG_CHUNK) {
+      const logs = await rpc('eth_getLogs', [{
+        address: VAULT,
+        fromBlock: '0x' + start.toString(16),
+        toBlock: '0x' + Math.min(start + LOG_CHUNK - 1, latest).toString(16),
+        topics: [TOPIC_STAKED, null, padAddr(account)],
+      }]);
+      for (const l of logs) ever.add(BigInt(l.topics[1]).toString());
+      $('scanning').textContent = `searching… ${++done}/${chunks}`;
+    }
+
+    if (ever.size === 0) {
+      $('scanning').textContent = '';
+      $('found').textContent = 'No dinos were ever staked from this wallet. If you staked from a different address, connect that one instead.';
+      $('scan').disabled = false;
+      return;
+    }
+
+    const candidates = [...ever];
+    const held = [];
+    for (let i = 0; i < candidates.length; i += 40) {
+      const slice = candidates.slice(i, i + 40);
+      const results = await rpcBatch(slice.map((id) => ({
+        method: 'eth_call',
+        params: [{ to: VAULT, data: SEL.custodyOf + word(id) }, 'latest'],
+      })));
+      results.forEach((r, k) => {
+        if (r && decodeAddress(r).toLowerCase() === account.toLowerCase()) held.push(slice[k]);
+      });
+      $('scanning').textContent = `checking… ${Math.min(i + 40, candidates.length)}/${candidates.length}`;
+      await sleep(200);
+    }
+
+    held.sort((a, b) => Number(BigInt(a) - BigInt(b)));
+    tokenIds = held;
+    $('scanning').textContent = '';
+
+    if (held.length === 0) {
+      $('found').textContent = 'All of this wallet’s dinos have already been withdrawn. Nothing left to do.';
+      $('scan').disabled = false;
+      return;
+    }
+
+    const batches = Math.ceil(held.length / MAX_BATCH);
+    $('found').innerHTML =
+      `<strong>${held.length} dino${held.length === 1 ? '' : 's'}</strong> still in the vault:<br>` +
+      `<span class="mono">${held.map((t) => '#' + t).join(', ')}</span>`;
+    $('batchNote').textContent = batches > 1
+      ? `${batches} transactions — your wallet will prompt ${batches} times`
+      : '';
+    $('withdraw').disabled = !exitFn;
+    $('scan').disabled = false;
+  } catch (e) {
+    $('scanning').textContent = '';
+    $('found').innerHTML = '<span class="err">' + esc(e.message || e) + '</span>';
+    $('scan').disabled = false;
+  }
+});
+
+/* --------------------------------------------------------------- withdraw */
+
+$('withdraw').addEventListener('click', async () => {
+  if (!exitFn || tokenIds.length === 0) return;
+  $('withdraw').disabled = true;
+
+  const batches = [];
+  for (let i = 0; i < tokenIds.length; i += MAX_BATCH) batches.push(tokenIds.slice(i, i + MAX_BATCH));
+
+  let sent = 0;
+  for (const batch of batches) {
+    $('txStatus').textContent = `Confirm transaction ${sent + 1} of ${batches.length} in your wallet…`;
+    try {
+      const hash = await provider.request({
+        method: 'eth_sendTransaction',
+        params: [{ from: account, to: VAULT, data: encodeUintArray(SEL[exitFn], batch) }],
+      });
+      sent++;
+      $('txStatus').innerHTML = `Sent ${sent} of ${batches.length}. <span class="mono">${esc(hash)}</span>`;
+    } catch (e) {
+      $('txStatus').innerHTML =
+        `<span class="err">Stopped after ${sent} of ${batches.length}. ${esc((e && (e.message || e.data && e.data.message)) || e)}</span><br>` +
+        `Nothing was lost. Press “Find my dinos” again to see what is left, then retry.`;
+      $('withdraw').disabled = false;
+      return;
+    }
+  }
+  $('txStatus').textContent =
+    `All ${batches.length} transaction${batches.length === 1 ? '' : 's'} sent. Once they confirm, your dinos are back in your wallet. Press “Find my dinos” again to verify.`;
+});
+
+</script>
+</body>
+</html>
