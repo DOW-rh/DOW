@@ -52,6 +52,7 @@ withdraw them yourself from the menu below.</p>
 
 <section>
   <button id="connect">Connect wallet</button>
+  <button id="disconnect" hidden>Disconnect</button>
   <span id="account" class="mono"></span>
   <p id="wallets" class="note"></p>
   <p id="chainStatus" class="note"></p>
@@ -254,10 +255,9 @@ async function connect() {
     account = (await provider.request({ method: 'eth_requestAccounts' }))[0];
     $('account').textContent = account;
     $('connect').textContent = 'Connected';
-    if (provider.on) {
-      provider.on('accountsChanged', () => window.location.reload());
-      provider.on('chainChanged', () => window.location.reload());
-    }
+    $('connect').disabled = true;
+    $('disconnect').hidden = false;
+    attachListeners();
     await ensureChain();
     await readVaultMode();
     $('scan').disabled = false;
@@ -265,6 +265,102 @@ async function connect() {
     $('chainStatus').innerHTML = '<span class="err">' + esc(e.message || e) + '</span>';
   }
 }
+
+/* ------------------------------------------------- switching and leaving */
+
+/*
+ * EIP-1193 events, handled in place rather than by reloading the page.
+ *
+ * `accountsChanged` fires when somebody switches the active account inside
+ * their wallet, and arrives with an empty array when they lock it or revoke
+ * this site. Either way the token list on screen belongs to the previous
+ * account and has to be cleared -- showing wallet A's dinos while wallet B is
+ * connected is how somebody signs a transaction that reverts, or worse, stops
+ * believing the page.
+ *
+ * Handlers are kept so they can be removed again on disconnect; without that,
+ * connecting to a second wallet in one session leaves the first one's listeners
+ * attached and both fire.
+ */
+let listeners = null;
+
+function attachListeners() {
+  if (!provider || !provider.on || listeners) return;
+  listeners = {
+    accountsChanged: (accounts) => {
+      if (!accounts || accounts.length === 0) { reset('Wallet locked or disconnected.'); return; }
+      account = accounts[0];
+      $('account').textContent = account;
+      clearTokens();
+      // Not in chainStatus: readVaultMode() owns that line and would overwrite it.
+      $('found').textContent = 'Switched account — press “Find my dinos” again.';
+      readVaultMode().catch(() => {});
+    },
+    chainChanged: () => {
+      clearTokens();
+      ensureChain().then(readVaultMode).catch((e) => {
+        $('chainStatus').innerHTML = '<span class="err">' + esc(e.message || e) + '</span>';
+      });
+    },
+  };
+  provider.on('accountsChanged', listeners.accountsChanged);
+  provider.on('chainChanged', listeners.chainChanged);
+}
+
+function detachListeners() {
+  const off = provider && (provider.removeListener || provider.off);
+  if (off && listeners) {
+    for (const [event, fn] of Object.entries(listeners)) off.call(provider, event, fn);
+  }
+  listeners = null;
+}
+
+/* Anything derived from the old account stops being true. */
+function clearTokens() {
+  tokenIds = [];
+  $('found').textContent = '';
+  $('batchNote').textContent = '';
+  $('txStatus').textContent = '';
+  $('withdraw').disabled = true;
+}
+
+function reset(message) {
+  detachListeners();
+  provider = null;
+  account = null;
+  exitFn = null;
+  clearTokens();
+  $('account').textContent = '';
+  $('wallets').textContent = '';
+  $('connect').textContent = 'Connect wallet';
+  $('connect').disabled = false;
+  $('disconnect').hidden = true;
+  $('scan').disabled = true;
+  $('chainStatus').textContent = message || '';
+}
+
+/*
+ * There is no true disconnect in EIP-1193 -- a page cannot revoke its own
+ * access. `wallet_revokePermissions` does it properly where it is supported
+ * (MetaMask and some others); everywhere else this just forgets the wallet on
+ * this page, which is what the button is actually for. Either way the holder is
+ * told which happened rather than being left to guess.
+ */
+$('disconnect').addEventListener('click', async () => {
+  let revoked = false;
+  try {
+    await provider.request({
+      method: 'wallet_revokePermissions',
+      params: [{ eth_accounts: {} }],
+    });
+    revoked = true;
+  } catch (e) {
+    // Unsupported on this wallet; local reset below is still correct.
+  }
+  reset(revoked
+    ? 'Disconnected.'
+    : 'Forgotten on this page. Your wallet may still list this site as connected — remove it there if you want that cleared too.');
+});
 
 async function ensureChain() {
   const current = await provider.request({ method: 'eth_chainId' });
