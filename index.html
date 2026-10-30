@@ -42,7 +42,7 @@
 
 <h1>Dinos of Wallstreet</h1>
 
-<p>Operational costs have exceeded inflow for several weeks now, so it is with  
+<p>Operational costs have exceeded inflow for several weeks now, so it is with
 sadness that we must announce that we are shutting down the Dinos of Wallstreet
 experience. We hold no custody over your staked NFTs, so you&rsquo;ll need to
 withdraw them yourself from the menu below.</p>
@@ -164,32 +164,74 @@ window.addEventListener('eip6963:announceProvider', (event) => {
   const d = event.detail;
   if (d && d.info && d.provider) discovered.set(d.info.rdns || d.info.name, d);
 });
-window.dispatchEvent(new Event('eip6963:requestProvider'));
+const ask = () => window.dispatchEvent(new Event('eip6963:requestProvider'));
+ask();
 
+/*
+ * Everything that might be a wallet, gathered from all three conventions that
+ * exist in the wild:
+ *
+ *   EIP-6963 announcements -- the current standard, and the only reliable one
+ *     when several extensions are installed;
+ *   `window.ethereum.providers` -- the array some conflict managers expose when
+ *     more than one wallet is fighting over `window.ethereum`;
+ *   `window.ethereum` itself -- wallets older than 6963.
+ *
+ * Deduplicated by provider object identity, because a 6963 wallet usually also
+ * assigns `window.ethereum` and we do not want it listed twice.
+ */
 function available() {
   const list = [...discovered.values()].map((d) => ({ name: d.info.name, provider: d.provider }));
-  if (list.length === 0 && window.ethereum) list.push({ name: 'Browser wallet', provider: window.ethereum });
+  const seen = new Set(list.map((w) => w.provider));
+  const eth = window.ethereum;
+  if (eth) {
+    const legacy = Array.isArray(eth.providers) && eth.providers.length ? eth.providers : [eth];
+    legacy.forEach((p, i) => {
+      if (!p || seen.has(p)) return;
+      seen.add(p);
+      const name = p.isMetaMask ? 'MetaMask'
+        : p.isRabby ? 'Rabby'
+        : p.isCoinbaseWallet ? 'Coinbase Wallet'
+        : p.isBraveWallet ? 'Brave Wallet'
+        : legacy.length > 1 ? 'Wallet ' + (i + 1)
+        : 'Browser wallet';
+      list.push({ name, provider: p });
+    });
+  }
   return list;
+}
+
+/*
+ * Extensions inject at their own pace, and some only answer a `requestProvider`
+ * that arrives after they are ready. Asking once on page load is not enough, so
+ * keep asking for a short while before concluding there is no wallet.
+ */
+async function discover(ms = 2000) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const found = available();
+    if (found.length) return found;
+    if (Date.now() >= deadline) return found;
+    ask();
+    await sleep(150);
+  }
 }
 
 /* ---------------------------------------------------------------- connect */
 
 $('connect').addEventListener('click', async () => {
-  // Give a late-injecting extension a moment, then ask again.
-  if (available().length === 0) {
-    window.dispatchEvent(new Event('eip6963:requestProvider'));
-    await sleep(300);
-  }
-
-  const wallets = available();
+  $('chainStatus').textContent = 'looking for a wallet…';
+  const wallets = await discover();
 
   if (wallets.length === 0) {
     $('chainStatus').innerHTML = '<span class="err">No wallet detected.</span>' +
       (location.protocol === 'file:'
         ? ' This page is open from a file on your computer, and wallet extensions do not work on <code>file://</code> pages unless you turn on “Allow access to file URLs” in the extension’s settings. Opening the published web link instead will work.'
-        : ' Open this page in a browser with a wallet extension, or in your wallet’s own browser.');
+        : ' If you have a wallet extension installed, try reloading the page, or open this link in your wallet’s own browser.');
     return;
   }
+
+  $('chainStatus').textContent = '';
 
   if (wallets.length > 1 && !provider) {
     $('wallets').innerHTML = 'Choose a wallet: ';
